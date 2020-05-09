@@ -141,3 +141,5 @@ cython_debug/
 java-helpers/
 .idea/
 books/
+helpers/
+*.iml
