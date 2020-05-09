@@ -1,0 +1,51 @@
+---
+version: "3.7"
+
+services:
+
+  zookeeper:
+    image: "bitnami/zookeeper:latest"
+    ports:
+      - "2181:2181"
+    networks:
+      - app-tier
+    environment:
+    - ALLOW_ANONYMOUS_LOGIN=yes
+
+  kafka_1:
+    image: "bitnami/kafka:latest"
+    ports:
+      - "29092:29092"   # External (host) connections. Port 9092 is used for internal connections
+    networks:
+      - app-tier
+    depends_on:
+      - zookeeper
+    environment:
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,PLAINTEXT_HOST://:29092     # 2 listeners (internal & external)
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka_1:9092,PLAINTEXT_HOST://localhost:29092
+      - KAFKA_BROKER_USER=client-user       # auth from clients
+      - KAFKA_BROKER_PASSWORD=ChangeMe
+
+  kafka_2:
+    image: "bitnami/kafka:latest"
+    ports:
+      - "29093:29093"   # External (host) connections. Port 9092 is used for internal connections
+    networks:
+      - app-tier
+    depends_on:
+      - zookeeper
+    environment:
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,PLAINTEXT_HOST://:29093     # 2 listeners (internal & external)
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka_2:9092,PLAINTEXT_HOST://localhost:29093
+      - KAFKA_BROKER_USER=client-user       # auth from clients
+      - KAFKA_BROKER_PASSWORD=ChangeMe
+
+networks:
+  app-tier:
+    driver: bridge
