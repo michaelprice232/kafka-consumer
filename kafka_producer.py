@@ -7,6 +7,9 @@ import sys
 import re
 import json
 import requests
+from bs4 import BeautifulSoup
+import zipfile
+import os
 
 
 def delivery_report(err, msg):
@@ -176,6 +179,26 @@ def display_producer_stats(result_object):
     print("Number of sent Kafka messages: {}".format(result_object["sent_kafka_messages"]))
 
 
+def extract_href_links_from_html_page(page, regex="^http.+zip$"):
+    """
+    Extracts the href links from a HTML page. Ensures the URLs match a particular format to avoid invalid links
+
+    :param page: the raw HTML page containing the links
+    :param regex: regex used to help filter out partial links. Defaults to ^http.+zip$
+    :return: list of hrefs extracted from the page
+    """
+
+    # Extract the href links from the HTML page & add to a list
+    extracted_href_links = []
+    soup = BeautifulSoup(page, "html.parser")
+
+    for link in soup.find_all("a"):
+        if re.search(regex, link.get("href")):
+            extracted_href_links.append(link.get("href"))
+
+    return extracted_href_links
+
+
 if __name__ == "__main__":
 
     # Variables todo: extract as environment variables
@@ -184,19 +207,75 @@ if __name__ == "__main__":
     poll_timeout_seconds = 2
     title_regex_prefix = "^Title:"
     text_file_path = "./books/76-0.txt"    # todo: read books from web
+    num_books_to_process = 1
+    book_source_download_url = "http://www.gutenberg.org/robot/harvest?filetypes[]=txt&langs[]=en"
 
-    # Create Kafka Producer client
-    p = Producer(kafka_client_config)
+    temp_download_path = "./temp-download-location"
+    temp_extracted_files_path = temp_download_path + "/extracted-files/"
+    temp_archive_path = temp_download_path + "/temp-archive-file.zip"
 
-    # Process messages
-    result = process_book_lines(client=p, file_path=text_file_path, prefix=title_regex_prefix, kafka_topic=topic)
+    # # Create Kafka Producer client
+    # p = Producer(kafka_client_config)
+    #
+    # # Process messages
+    # result = process_book_lines(client=p, file_path=text_file_path, prefix=title_regex_prefix, kafka_topic=topic)
+    #
+    # # Wait until all the messages have been delivered to the broker
+    # print("Waiting until all the messages have been delivered to the broker")
+    # p.flush()
+    #
+    # # Display results
+    # print("\nShow statistics\n================")
+    # display_producer_stats(result)
+    #
+    # print("\nProcessed all books. Complete!")
 
-    # Wait until all the messages have been delivered to the broker
-    print("Waiting until all the messages have been delivered to the broker")
-    p.flush()
+    # Create pre-req directories
+    if not os.path.exists(temp_download_path):
+        print("Creating temporary directories for storing extracted data and archive files:")
+        os.mkdir(temp_download_path)
+        print("> Created {}".format(temp_download_path))
+    if not os.path.exists(temp_extracted_files_path):
+        os.mkdir(temp_extracted_files_path)
+        print("> Created {}".format(temp_extracted_files_path))
 
-    # Display results
-    print("\nShow statistics\n================")
-    display_producer_stats(result)
+    # Download HTML page containing a paginated list of (English) raw text (txt) files from Project Gutenberg
+    print("Requesting the (paginated) list of book archive files from: {}".format(book_source_download_url))
+    html_page = requests.get(book_source_download_url).text
 
-    print("\nProcessed all books. Complete!")
+    # Extract href links from HTML page
+    archive_links_list = extract_href_links_from_html_page(html_page)
+
+    # Download and un-archive files
+    if len(archive_links_list) > 0:
+        print("{} links retrieved".format(len(archive_links_list)))
+        print("Configured to process {} archive(s)".format(num_books_to_process))
+
+        # Iterate over the requested number of books
+        for url in archive_links_list[0:num_books_to_process]:
+            print("\nProcessing: {}".format(url))
+
+            # Steam the download to file
+            r = requests.get(url, stream=True)
+
+            with open(temp_archive_path, 'wb') as fd:
+                for chunk in r.iter_content(chunk_size=128):
+                    fd.write(chunk)
+            print("> Download complete. Unpacking...")
+
+            # Unzip the archive
+            with zipfile.ZipFile(temp_archive_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_extracted_files_path)
+            print("> Finished unpacking. Files are located in: {}\n".format(temp_extracted_files_path))
+
+            # Find all the txt files which have been unpacked - pass to process_book_lines function
+
+
+    # Clean up
+    # todo: add cleanup of temp files
+
+    else:
+        print("No links were returned. Exiting")
+        sys.exit(2)
+
+
