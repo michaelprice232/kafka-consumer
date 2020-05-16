@@ -10,6 +10,8 @@ import requests
 from bs4 import BeautifulSoup
 import zipfile
 import os
+import fnmatch
+import tempfile
 
 
 def delivery_report(err, msg):
@@ -58,7 +60,7 @@ def read_text_file_to_list(path):
 
     :param path: path to the text file
 
-    :return list containing each line as an item
+    :return list containing each line as an item. Return False if unable to complete successfully
     """
     try:
         file = open(path, "r")
@@ -66,8 +68,12 @@ def read_text_file_to_list(path):
         return file.readlines()
 
     except FileNotFoundError:
-        print("Unable to find file: {}".format(path))
+        print("ERR: Unable to find file: {}".format(path))
         sys.exit(1)
+
+    except UnicodeDecodeError:
+        print("WARN: Unable to decode file: {}".format(path))
+        return False
 
 
 def find_book_title_in_text_file(path, regex_prefix="^Title:"):
@@ -84,23 +90,28 @@ def find_book_title_in_text_file(path, regex_prefix="^Title:"):
 
     title_line = None           # the title to return
     count_matched = 0           # the number of matches. Ensures we only have one match for consistency
+
     lines = read_text_file_to_list(path)
+    # Check for a successful response
+    if lines:
+        # Iterate through the lines looking for the one containing the string prefix
+        # We only need to use a slice as the title information is always included in the top section of the text file
+        for line in lines[0:40]:
+            if re.search(regex_prefix, line, flags=re.IGNORECASE):
+                # Matching line found
+                length_of_string_prefix = len(regex_prefix)     # used to determine the start position of the title
+                title_line = line[length_of_string_prefix:]     # remove the prefix from the string
+                count_matched += 1
 
-    # Iterate through the lines looking for the one containing the string prefix
-    # We only need to use a slice as the title information is always included in the top section of the text file
-    for line in lines[0:40]:
-        if re.search(regex_prefix, line, flags=re.IGNORECASE):
-            # Matching line found
-            length_of_string_prefix = len(regex_prefix)     # used to determine the start position of the title
-            title_line = line[length_of_string_prefix:]     # remove the prefix from the string
-            count_matched += 1
-
-    # Check whether we have found a match
-    if count_matched == 1:
-        # Found exactly one match - success
-        return title_line
+        # Check whether we have found a match
+        if count_matched == 1:
+            # Found exactly one match - success
+            return title_line
+        else:
+            # no matches or multiple matches - failure
+            return False
     else:
-        # no matches or multiple matches - failure
+        # Unable to establish book title
         return False
 
 
@@ -115,8 +126,7 @@ def process_book_lines(client, file_path, prefix, kafka_topic):
     :param file_path: path to the text file (book)
     :param prefix: regex for describing the string prefix before the title information in the file
     :param kafka_topic:which Kafka topic to write to
-    :param on_delivery_handler: function which handles the on_delivery callback handling
-    :return Dict containing book path, name and some stats (# lines, and # newline character lines)
+    :return Dict containing book path, name and some stats. Empty dict on failure
     """
 
     # Read from text file. Attempt to find book title in the text
@@ -159,8 +169,9 @@ def process_book_lines(client, file_path, prefix, kafka_topic):
         }
 
     else:
-        print("Unable to retrieve the book title from the file '{}' using prefix '{}'".format(file_path, prefix))
-        sys.exit(2)
+        print("Unable to retrieve the book title from the file '{}' using prefix '{}'."
+              "\nNo kafka messages to send".format(file_path, prefix))
+        return {}
 
 
 def display_producer_stats(result_object):
@@ -177,6 +188,7 @@ def display_producer_stats(result_object):
     print("Total number of lines in this book: {}".format(result_object["total_number_of_lines"]))
     print("Number of newline only lines: {}".format(result_object["total_just_newline_lines"]))
     print("Number of sent Kafka messages: {}".format(result_object["sent_kafka_messages"]))
+    print("")
 
 
 def extract_href_links_from_html_page(page, regex="^http.+zip$"):
@@ -199,49 +211,48 @@ def extract_href_links_from_html_page(page, regex="^http.+zip$"):
     return extracted_href_links
 
 
+def find_files_in_directory(pattern, path):
+    """
+    Returns a list of files which match a filename pattern within the directory path, including subdirectories
+    :param pattern: shell glob style pattern to match against filenames
+    :param path: the base directory to start the search from
+    :return: list of files which match the pattern
+    """
+    # Check the path is a directory
+    if os.path.isdir(path):
+        result = []
+        # Iterate through all directories (inc. sub directories), and compare the filename against the pattern
+        for root, dirs, files in os.walk(path):
+            for name in files:
+                if fnmatch.fnmatch(name, pattern):
+                    result.append(os.path.join(root, name))
+        return result
+    else:
+        Exception("{} is not a directory".format(path))
+        sys.exit(1)
+
+
 if __name__ == "__main__":
 
     # Variables todo: extract as environment variables
+    initial_offset_for_books_to_process = 0
+    num_books_to_process = 90
+
     kafka_client_config = {"bootstrap.servers": "localhost:29092,localhost:29093"}
     topic = "important-topic"
     poll_timeout_seconds = 2
     title_regex_prefix = "^Title:"
-    text_file_path = "./books/76-0.txt"    # todo: read books from web
-    num_books_to_process = 1
-    book_source_download_url = "http://www.gutenberg.org/robot/harvest?filetypes[]=txt&langs[]=en"
-
-    temp_download_path = "./temp-download-location"
-    temp_extracted_files_path = temp_download_path + "/extracted-files/"
-    temp_archive_path = temp_download_path + "/temp-archive-file.zip"
-
-    # # Create Kafka Producer client
-    # p = Producer(kafka_client_config)
-    #
-    # # Process messages
-    # result = process_book_lines(client=p, file_path=text_file_path, prefix=title_regex_prefix, kafka_topic=topic)
-    #
-    # # Wait until all the messages have been delivered to the broker
-    # print("Waiting until all the messages have been delivered to the broker")
-    # p.flush()
-    #
-    # # Display results
-    # print("\nShow statistics\n================")
-    # display_producer_stats(result)
-    #
-    # print("\nProcessed all books. Complete!")
-
-    # Create pre-req directories
-    if not os.path.exists(temp_download_path):
-        print("Creating temporary directories for storing extracted data and archive files:")
-        os.mkdir(temp_download_path)
-        print("> Created {}".format(temp_download_path))
-    if not os.path.exists(temp_extracted_files_path):
-        os.mkdir(temp_extracted_files_path)
-        print("> Created {}".format(temp_extracted_files_path))
+    filename_glob_pattern = "*.txt"
+    book_source_download_url = "http://www.gutenberg.org/robot/harvest?offset=40536&filetypes[]=txt&langs[]=en"
+    # book_source_download_url = "http://www.gutenberg.org/robot/harvest?filetypes[]=txt&langs[]=en"
+    list_of_sending_stats = []
+    list_of_failed_to_process_books = []
 
     # Download HTML page containing a paginated list of (English) raw text (txt) files from Project Gutenberg
     print("Requesting the (paginated) list of book archive files from: {}".format(book_source_download_url))
-    html_page = requests.get(book_source_download_url).text
+    r = requests.get(book_source_download_url)
+    html_page = r.text
+    response_time = r.elapsed.total_seconds()
 
     # Extract href links from HTML page
     archive_links_list = extract_href_links_from_html_page(html_page)
@@ -249,33 +260,78 @@ if __name__ == "__main__":
     # Download and un-archive files
     if len(archive_links_list) > 0:
         print("{} links retrieved".format(len(archive_links_list)))
+        print("Server response time: {} seconds".format(response_time))
         print("Configured to process {} archive(s)".format(num_books_to_process))
 
-        # Iterate over the requested number of books
-        for url in archive_links_list[0:num_books_to_process]:
-            print("\nProcessing: {}".format(url))
+        # Iterate over the requested number of archives
+        for url in archive_links_list[initial_offset_for_books_to_process:
+                                      initial_offset_for_books_to_process+num_books_to_process]:
+            print("\n> Processing archive: {}".format(url))
 
-            # Steam the download to file
+            # Steam the download to temporary file
             r = requests.get(url, stream=True)
 
-            with open(temp_archive_path, 'wb') as fd:
+            with tempfile.TemporaryFile(mode='w+b') as temp_archive_name:   # read + write + binary mode
                 for chunk in r.iter_content(chunk_size=128):
-                    fd.write(chunk)
-            print("> Download complete. Unpacking...")
+                    temp_archive_name.write(chunk)
+                print("Download complete. Unpacking...")
 
-            # Unzip the archive
-            with zipfile.ZipFile(temp_archive_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_extracted_files_path)
-            print("> Finished unpacking. Files are located in: {}\n".format(temp_extracted_files_path))
+                # Unpack the archive to a temp directory
+                with tempfile.TemporaryDirectory() as temp_dir_name:
+                    with zipfile.ZipFile(temp_archive_name, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir_name)
+                    zip_ref.close()
+                    print("Finished unpacking. Files are located in: {}".format(temp_dir_name))
 
-            # Find all the txt files which have been unpacked - pass to process_book_lines function
+                    # Find all the txt files which have been unpacked
+                    list_of_txt_files = find_files_in_directory(filename_glob_pattern, temp_dir_name)
 
+                    # Output how many matching files have been found in the archive
+                    print("There are {} file(s) matching the pattern '{}'"
+                          .format(len(list_of_txt_files), filename_glob_pattern))
 
-    # Clean up
-    # todo: add cleanup of temp files
+                    # Only one file found matching the pattern. Currently the only supported route
+                    if len(list_of_txt_files) == 1:
+                        # Create Kafka Producer client
+                        p = Producer(kafka_client_config)
+
+                        # Process messages
+                        result = process_book_lines(client=p, file_path=list_of_txt_files[0],
+                                                    prefix=title_regex_prefix, kafka_topic=topic)
+
+                        # Successful book title lookup and messages have been sent to kafka
+                        if result:
+                            print("Waiting until all the messages have been delivered to the broker")
+                            p.flush()
+
+                            # Add to list to allow us to display stats at the end
+                            list_of_sending_stats.append(result)
+
+                        # Keep track of books we failed to process
+                        else:
+                            list_of_failed_to_process_books.append({"url": url})
+
+                    # Multiple files matching the pattern in the archive - skipping as not currently supported
+                    elif len(list_of_txt_files) > 1:
+                        print("WARN: Skipping archive. Multiple matching files are currently not supported")
+                        list_of_failed_to_process_books.append({"url": url})
+
+                    # No files matching the pattern in the archive
+                    else:
+                        print("WARN: Skipping archive. No matching files found")
+                        list_of_failed_to_process_books.append({"url": url})
+
+        # Display stats
+        print("\nShow statistics\n================")
+        for s in list_of_sending_stats:
+            display_producer_stats(s)
+
+        print("\nTotals:\n========")
+        print("Successfully processed {} archives\nFailed to process {} archives"
+              .format(len(list_of_sending_stats), len(list_of_failed_to_process_books)))
+
+        print("\nComplete!")
 
     else:
         print("No links were returned. Exiting")
         sys.exit(2)
-
-
