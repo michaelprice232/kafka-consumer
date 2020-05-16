@@ -28,9 +28,9 @@ def delivery_report(err, msg):
     if err:
         # error
         print("% Message failed delivery {}".format(err), file=sys.stderr)
-    else:
-        # success
-        print("% Message delivered to {} [{}] @ {}".format(msg.topic(), msg.partition(), msg.offset()))
+    # else:
+    #     # success
+    #     print("% Message delivered to {} [{}] @ {}".format(msg.topic(), msg.partition(), msg.offset()))
 
 
 def produce_kafka_message(client, topic, message):
@@ -235,8 +235,7 @@ def find_files_in_directory(pattern, path):
 if __name__ == "__main__":
 
     # Variables todo: extract as environment variables
-    initial_offset_for_books_to_process = 0
-    num_books_to_process = 90
+    num_books_to_process = 4
 
     kafka_client_config = {"bootstrap.servers": "localhost:29092,localhost:29093"}
     topic = "important-topic"
@@ -264,8 +263,7 @@ if __name__ == "__main__":
         print("Configured to process {} archive(s)".format(num_books_to_process))
 
         # Iterate over the requested number of archives
-        for url in archive_links_list[initial_offset_for_books_to_process:
-                                      initial_offset_for_books_to_process+num_books_to_process]:
+        for url in archive_links_list[:num_books_to_process]:
             print("\n> Processing archive: {}".format(url))
 
             # Steam the download to temporary file
@@ -326,7 +324,7 @@ if __name__ == "__main__":
         for s in list_of_sending_stats:
             display_producer_stats(s)
 
-        print("\nTotals:\n========")
+        print("Totals:\n========")
         print("Successfully processed {} archives\nFailed to process {} archives"
               .format(len(list_of_sending_stats), len(list_of_failed_to_process_books)))
 
