@@ -57,15 +57,32 @@ def produce_kafka_message(client, topic, message):
 def read_text_file_to_list(path):
     """
     Reads a text file and returns a list of the lines
-
     :param path: path to the text file
-
     :return list containing each line as an item. Return False if unable to complete successfully
     """
     try:
         file = open(path, "r")
         # Reads all lines and splits to list
         return file.readlines()
+
+    except FileNotFoundError:
+        print("WARN: Unable to find file: {}".format(path))
+        return False
+
+    except UnicodeDecodeError:
+        print("WARN: Unable to decode file: {}".format(path))
+        return False
+
+
+def read_text_file_to_string(path):
+    """
+    Reads a text file and returns a string
+    :param path: path to the text file
+    :return string containing the contents of text file. Return False if unable to complete successfully
+    """
+    try:
+        file = open(path, "r")
+        return file.read()
 
     except FileNotFoundError:
         print("WARN: Unable to find file: {}".format(path))
@@ -84,7 +101,6 @@ def find_book_title_in_text_file(path, regex_prefix="^Title:"):
 
     :param path: path to the text file
     :param regex_prefix: regex for describing the string prefix before the title information in the file
-
     :return False on no match or multiple matches. On a single match the string containing the title is returned
     """
 
@@ -115,81 +131,46 @@ def find_book_title_in_text_file(path, regex_prefix="^Title:"):
         return False
 
 
-def process_book_lines(client, file_path, prefix, kafka_topic):
+def process_book_in_full(client, file_path, prefix, kafka_topic):
     """
-    Process the individual lines in the book text file
-    Filter out just newline lines.
-    Produce Kafka messages based on the book title and current line
-    These messages will be consumed by a downstream Kafka client
+    Process the a text file to a) determine it's title b) send the contents to a kafka broker
+    These will be processed by a downstream kafka consumer
 
     :param client: handle to the Kafka Producer object
     :param file_path: path to the text file (book)
     :param prefix: regex for describing the string prefix before the title information in the file
     :param kafka_topic:which Kafka topic to write to
-    :return Dict containing book path, name and some stats. Empty dict on failure
+    :return Dict containing book title and path. Empty dict on failure
     """
 
-    # Read from text file. Attempt to find book title in the text
+    # Attempt to find book title in the text
     book_title = find_book_title_in_text_file(file_path, prefix)
 
     if book_title:
-        print("Current file: {}\nBook Title: {}".format(file_path, book_title), end="")       # end=""
+        print("Current file: {}\nBook Title: {}".format(file_path, book_title), end="")
 
-        # Split the book into a list of strings (one per line)
-        text_file_contents_list = read_text_file_to_list(file_path)
-        if not text_file_contents_list:
+        # Read the text file as single string. Check we could open the file and it is not empty
+        full_book_as_string = read_text_file_to_string(file_path)
+        if not full_book_as_string:
             print("Unable to open file: {}".format(file_path))
             return {}
-        total_number_of_lines = len(text_file_contents_list)
 
-        # Iterate through the book lines, create a json representation of a dict for each, and produce a Kafka message
-        newline_lines = 0           # counter for lines containing just newline characters
-        sent_kafka_messages = 0     # counter for messages sent to Kafka
-        for line in text_file_contents_list:
-
-            # Remove any lines just containing newline characters
-            if line != "\n":
-                kafka_message_json = json.dumps({
-                    "book_title": book_title,
-                    "book_line": line
-                })
-
-                # Send message (async)
-                produce_kafka_message(client=client, topic=kafka_topic, message=kafka_message_json)
-
-                sent_kafka_messages += 1
-
-            else:
-                # the line is just a newline character. Don't send it, just record the count
-                newline_lines += 1
+        # Send Kafka message (async)
+        kafka_message_json = json.dumps({
+            "book_title": book_title,
+            "contents": full_book_as_string
+        })
+        produce_kafka_message(client=client, topic=kafka_topic, message=kafka_message_json)
 
         return {
             "book_title": book_title,
-            "file_path": file_path,
-            "total_number_of_lines": total_number_of_lines,
-            "total_just_newline_lines": newline_lines,
-            "sent_kafka_messages": sent_kafka_messages
+            "file_path": file_path
         }
 
     else:
         print("Unable to retrieve the book title from the file '{}' using prefix '{}'. "
               "No kafka messages to send".format(file_path, prefix))
         return {}
-
-
-def display_producer_stats(result_object):
-    """
-    Display some stats generated by the producer
-    :param result_object: Dict containing the producer results after sending Kafka messages
-    :return: None
-    """
-
-    # Display some producer stats
-    print("File: {}\nBook Title: {}".format(result_object["file_path"], result_object["book_title"]), end="")
-    print("Total number of lines in this book: {}".format(result_object["total_number_of_lines"]))
-    print("Number of newline only lines: {}".format(result_object["total_just_newline_lines"]))
-    print("Number of sent Kafka messages: {}".format(result_object["sent_kafka_messages"]))
-    print("")
 
 
 def extract_href_links_from_html_page(page, regex="^http.+zip$"):
@@ -231,6 +212,31 @@ def find_files_in_directory(pattern, path):
     else:
         print("ERR: {} is not a directory".format(path))
         return 0
+
+
+def display_producer_stats(success_objects, failure_objects):
+    """
+    Displays the statistics for success and failures after processing books
+    :param success_objects: List containing the return objects for successful tasks
+    :param failure_objects: List containing the return objects for failed tasks
+    :return: None
+    """
+
+    # Display some producer stats
+    print("\n\nProducer Statistics\n====================\n")
+
+    if success_objects:
+        print("Successful tasks:\n===================")
+        for success in success_objects:
+            print("Title: {} (Path: {})".format(success["book_title"].rstrip(), success["file_path"]))
+
+    if failure_objects:
+        print("\nFailed tasks:\n===================")
+        for failure in failure_objects:
+            print("URL: {}".format(failure['url']))
+
+    print("\nSuccessfully processed {} archives\nFailed to process {} archives"
+          .format(len(success_objects), len(failure_objects)))
 
 
 if __name__ == "__main__":
@@ -297,8 +303,8 @@ if __name__ == "__main__":
                         p = Producer(kafka_client_config)
 
                         # Process messages
-                        result = process_book_lines(client=p, file_path=list_of_txt_files[0],
-                                                    prefix=title_regex_prefix, kafka_topic=topic)
+                        result = process_book_in_full(client=p, file_path=list_of_txt_files[0],
+                                                      prefix=title_regex_prefix, kafka_topic=topic)
 
                         # Successful book title lookup and messages have been sent to kafka
                         if result:
@@ -323,13 +329,7 @@ if __name__ == "__main__":
                         list_of_failed_to_process_books.append({"url": url})
 
         # Display stats
-        print("\nFinished Sending. Show statistics\n==============================")
-        for s in list_of_sending_stats:
-            display_producer_stats(s)
-
-        print("Totals:\n========")
-        print("Successfully processed {} archives\nFailed to process {} archives"
-              .format(len(list_of_sending_stats), len(list_of_failed_to_process_books)))
+        display_producer_stats(list_of_sending_stats, list_of_failed_to_process_books)
 
         print("\nComplete!")
 
