@@ -12,6 +12,7 @@ import zipfile
 import os
 import fnmatch
 import tempfile
+import time
 
 
 def delivery_report(err, msg):
@@ -51,7 +52,7 @@ def produce_kafka_message(client, topic, message):
         print("% Kafka exception: {}".format(e), file=sys.stderr)
 
     except BufferError:
-        print("% Local producer queue is full ({} messages awaiting delivery): try again".format(len(p)))
+        print("% Local producer queue is full ({} messages awaiting delivery): try again".format(len(client)))
 
 
 def read_text_file_to_list(path):
@@ -173,22 +174,57 @@ def process_book_in_full(client, file_path, prefix, kafka_topic):
         return {}
 
 
-def extract_href_links_from_html_page(page, regex="^http.+zip$"):
+def retrieve_archive_links(base_url_address, start_uri, required_num_links, timeout=5,
+                           file_name_regex="^http.+zip$", sleep_interval=0.5):
     """
-    Extracts the href links from a HTML page. Ensures the URLs match a particular format to avoid invalid links
-
-    :param page: the raw HTML page containing the links
-    :param regex: regex used to help filter out partial links. Defaults to ^http.+zip$
-    :return: list of hrefs extracted from the page
+    Iterate through paginated HTML pages until the requested number of archive href links are retrieved
+    :param base_url_address: Base URL which all the paginated URIs exist under
+    :param start_uri: The URI for the initial iteration (without any offset query string)
+    :param required_num_links: The minimum number of archive href links which need to be returned
+    :param file_name_regex: Regex used to match filenames to ensure we are matching only archive files
+    :param timeout: Max timeout for HTML requests.
+    :param sleep_interval: time (in seconds) to rest between each HTML request. Avoids overloading the server
+    :return: List containing the href links. False for any failures
     """
 
-    # Extract the href links from the HTML page & add to a list
+    links_retrieved = 0
+    current_uri = start_uri
     extracted_href_links = []
-    soup = BeautifulSoup(page, "html.parser")
 
-    for link in soup.find_all("a"):
-        if re.search(regex, link.get("href")):
-            extracted_href_links.append(link.get("href"))
+    print("Looking for {} links from {}...".format(required_num_links, base_url_address))
+
+    # Iterate until the total number of requested links has been retrieved for the paginated HTML pages
+    while links_retrieved < required_num_links:
+        try:
+            r = requests.get(base_url_address + current_uri, timeout=timeout)
+            html_page = r.text
+
+        except requests.ConnectionError as e:
+            print("Connection error. Please retry later: ".format(e))
+            return False
+
+        except requests.Timeout as e:
+            print("Request timed out: {} (set to {} seconds). Please retry later".format(e, timeout))
+            return False
+
+        # Parse the HTML page for href links
+        soup = BeautifulSoup(html_page, "html.parser")
+
+        soup_links = soup.find_all("a")
+        for link in soup_links:
+            # Ensure the link matches our desired filename pattern
+            if re.search(file_name_regex, link.get("href")):
+                extracted_href_links.append(link.get("href"))
+
+        links_retrieved = len(extracted_href_links)
+
+        # The next page link is always the last href on the page
+        next_uri = soup_links[-1].get("href")
+        print("Retrieved {} links; Current_uri: {}; Next_uri: {}; Query_time: {}s"
+              .format(links_retrieved, current_uri, next_uri, r.elapsed.total_seconds()))
+
+        current_uri = next_uri
+        time.sleep(sleep_interval)             # Reduce load on the remote server
 
     return extracted_href_links
 
@@ -242,38 +278,35 @@ def display_producer_stats(success_objects, failure_objects):
 if __name__ == "__main__":
 
     # Variables todo: extract as environment variables
-    num_books_to_process = 2
+    num_books_to_process = 30
 
     kafka_client_config = {"bootstrap.servers": "localhost:29092,localhost:29093"}
+    html_request_timeout = 5
     topic = "important-topic"
     title_regex_prefix = "^Title:"
     filename_glob_pattern = "*.txt"
-    book_source_download_url = "http://www.gutenberg.org/robot/harvest?offset=40536&filetypes[]=txt&langs[]=en"
-    # book_source_download_url = "http://www.gutenberg.org/robot/harvest?filetypes[]=txt&langs[]=en"
+    base_url = "http://www.gutenberg.org/robot/"
+    starting_uri = "harvest?filetypes[]=txt&langs[]=en"
     list_of_sending_stats = []
     list_of_failed_to_process_books = []
 
-    # Download HTML page containing a paginated list of (English) raw text (txt) files from Project Gutenberg
-    print("Requesting the (paginated) list of book archive files from: {}".format(book_source_download_url))
-    r = requests.get(book_source_download_url)
-    html_page = r.text
-    response_time = r.elapsed.total_seconds()
-
-    # Extract href links from HTML page
-    archive_links_list = extract_href_links_from_html_page(html_page)
+    archive_links_list = retrieve_archive_links(base_url, starting_uri, num_books_to_process, html_request_timeout)
+    if not archive_links_list:
+        print("ERR: Unable to retrieve any links. Exiting")
+        sys.exit(3)
 
     # Download and un-archive files
     if len(archive_links_list) > 0:
         print("{} links retrieved".format(len(archive_links_list)))
-        print("Server response time: {} seconds".format(response_time))
         print("Configured to process {} archive(s)".format(num_books_to_process))
 
         # Iterate over the requested number of archives
         for url in archive_links_list[:num_books_to_process]:
             print("\n> Processing archive: {}".format(url))
 
+            # todo: add error handling & optional sleep period
             # Steam the download to temporary file
-            r = requests.get(url, stream=True)
+            r = requests.get(url, stream=True, timeout=html_request_timeout)
 
             with tempfile.TemporaryFile(mode='w+b') as temp_archive_name:   # read + write + binary mode
                 for chunk in r.iter_content(chunk_size=128):
@@ -311,7 +344,7 @@ if __name__ == "__main__":
                             print("Waiting until all the messages have been delivered to the broker...")
                             p.flush()
 
-                            # Add to list to allow us to display stats at the end
+                            # Add to successful list to allow us to display stats at the end
                             list_of_sending_stats.append(result)
 
                         # Keep track of books we failed to process
