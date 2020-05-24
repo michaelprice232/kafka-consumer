@@ -15,6 +15,107 @@ import tempfile
 import time
 
 
+def retrieve_archive_links(base_url_address, start_uri, required_num_links, timeout=5,
+                           file_name_regex="^http.+zip$", sleep_interval=0.5):
+    """
+    Iterate through paginated HTML pages until the requested number of archive href links are retrieved
+    :param base_url_address: Base URL which all the paginated URIs exist under
+    :param start_uri: The URI for the initial iteration (without any offset query string)
+    :param required_num_links: The minimum number of archive href links which need to be returned
+    :param file_name_regex: Regex used to match filenames to ensure we are matching only archive files
+    :param timeout: Max timeout for HTML requests.
+    :param sleep_interval: time (in seconds) to rest between each HTML request. Avoids overloading the server
+    :return: List containing the href links. False for any failures
+    """
+
+    links_retrieved = 0
+    current_uri = start_uri
+    extracted_href_links = []
+
+    print("Looking for {} links from {}".format(required_num_links, base_url_address))
+
+    # Iterate until the total number of requested links has been retrieved for the paginated HTML pages
+    while links_retrieved < required_num_links:
+        try:
+            r = requests.get(base_url_address + current_uri, timeout=timeout)
+            html_page = r.text
+
+        except requests.ConnectionError as e:
+            print("Connection error. Please retry later: ".format(e))
+            return False
+
+        except requests.Timeout as e:
+            print("Request timed out: {} (set to {} seconds). Please retry later".format(e, timeout))
+            return False
+
+        # Parse the HTML page for href links
+        soup = BeautifulSoup(html_page, "html.parser")
+
+        soup_links = soup.find_all("a")
+        for link in soup_links:
+            # Ensure the link matches our desired filename pattern
+            if re.search(file_name_regex, link.get("href")):
+                extracted_href_links.append(link.get("href"))
+
+        links_retrieved = len(extracted_href_links)
+
+        # The next page link is always the last href on the page
+        next_uri = soup_links[-1].get("href")
+        print("Retrieved {} links; Current_uri: {}; Next_uri: {}; Query_time: {}s"
+              .format(links_retrieved, current_uri, next_uri, r.elapsed.total_seconds()))
+
+        current_uri = next_uri
+        time.sleep(sleep_interval)             # Reduce load on the remote server
+
+    return extracted_href_links
+
+
+def find_files_in_directory(pattern, path):
+    """
+    Returns a list of files which match a filename pattern within the directory path, including subdirectories
+    :param pattern: shell glob style pattern to match against filenames
+    :param path: the base directory to start the search from
+    :return: list of files which match the pattern. Return 0 if it isn't a directory
+    """
+    # Check the path is a directory
+    if os.path.isdir(path):
+        found_files = []
+        # Iterate through all directories (inc. sub directories), and compare the filename against the pattern
+        for root, dirs, files in os.walk(path):
+            for name in files:
+                if fnmatch.fnmatch(name, pattern):
+                    found_files.append(os.path.join(root, name))
+        return found_files
+    else:
+        print("ERR: {} is not a directory".format(path))
+        return 0
+
+
+def display_producer_stats(success_objects, failure_objects):
+    """
+    Displays the statistics for success and failures after processing books
+    :param success_objects: List containing the return objects for successful tasks
+    :param failure_objects: List containing the return objects for failed tasks
+    :return: None
+    """
+
+    # Display some producer stats
+    print("\n\nProducer Statistics\n====================\n")
+
+    if success_objects:
+        print("Successful tasks:\n===================")
+        for success in success_objects:
+            print("{} ({})".format(success["book_title"].rstrip(), success["file_path"]))
+
+    if failure_objects:
+        print("\nFailed tasks:\n===================")
+        for failure in failure_objects:
+            print("URL: {}".format(failure))
+
+    print("\nSuccessfully processed {} archives\nFailed to process {} archives"
+          .format(len(success_objects), len(failure_objects)))
+
+
 def delivery_report(err, msg):
     """
     Called once for each message produced to indicate delivery result (to brokers)
@@ -55,6 +156,7 @@ def produce_kafka_message(client, topic, message):
         print("% Local producer queue is full ({} messages awaiting delivery): try again".format(len(client)))
 
 
+# todo: resolve unicode error (encoding?)
 def read_text_file_to_list(path):
     """
     Reads a text file and returns a list of the lines
@@ -134,14 +236,14 @@ def find_book_title_in_text_file(path, regex_prefix="^Title:"):
 
 def process_book_in_full(client, file_path, prefix, kafka_topic):
     """
-    Process the a text file to a) determine it's title b) send the contents to a kafka broker
+    Process the a text file to a) determine it's title b) send the contents to a kafka broker.
     These will be processed by a downstream kafka consumer
 
     :param client: handle to the Kafka Producer object
     :param file_path: path to the text file (book)
     :param prefix: regex for describing the string prefix before the title information in the file
     :param kafka_topic:which Kafka topic to write to
-    :return Dict containing book title and path. Empty dict on failure
+    :return Dict containing book title and path. Return False on failure
     """
 
     # Attempt to find book title in the text
@@ -154,7 +256,7 @@ def process_book_in_full(client, file_path, prefix, kafka_topic):
         full_book_as_string = read_text_file_to_string(file_path)
         if not full_book_as_string:
             print("Unable to open file: {}".format(file_path))
-            return {}
+            return False
 
         # Send Kafka message (async)
         kafka_message_json = json.dumps({
@@ -169,118 +271,78 @@ def process_book_in_full(client, file_path, prefix, kafka_topic):
         }
 
     else:
-        print("Unable to retrieve the book title from the file '{}' using prefix '{}'. "
-              "No kafka messages to send".format(file_path, prefix))
-        return {}
+        print("Unable to retrieve the book title from the file '{}' using prefix '{}'".format(file_path, prefix))
+        return False
 
 
-def retrieve_archive_links(base_url_address, start_uri, required_num_links, timeout=5,
-                           file_name_regex="^http.+zip$", sleep_interval=0.5):
-    """
-    Iterate through paginated HTML pages until the requested number of archive href links are retrieved
-    :param base_url_address: Base URL which all the paginated URIs exist under
-    :param start_uri: The URI for the initial iteration (without any offset query string)
-    :param required_num_links: The minimum number of archive href links which need to be returned
-    :param file_name_regex: Regex used to match filenames to ensure we are matching only archive files
-    :param timeout: Max timeout for HTML requests.
-    :param sleep_interval: time (in seconds) to rest between each HTML request. Avoids overloading the server
-    :return: List containing the href links. False for any failures
-    """
+def process_archive(kafka_client_config, archive_url, timeout, filename_glob_pattern, title_regex_prefix, topic):
+    print("\n> Processing archive: {}".format(archive_url))
 
-    links_retrieved = 0
-    current_uri = start_uri
-    extracted_href_links = []
+    # todo: add error handling & optional sleep period
+    # Steam the download to temporary file
+    # Settings Stream=True mean the download is deferred until iter_content is called
+    r = requests.get(archive_url, stream=True, timeout=timeout)
 
-    print("Looking for {} links from {}...".format(required_num_links, base_url_address))
+    with tempfile.TemporaryFile(mode='w+b') as temp_archive_name:   # read + write + binary mode
+        for chunk in r.iter_content(chunk_size=128):
+            temp_archive_name.write(chunk)
+        # Check a file is now present and it contains data
+        if os.stat(temp_archive_name.name).st_size > 0:
+            print("Download complete ({} bytes). Unpacking...".format(os.stat(temp_archive_name.name).st_size))
+        else:
+            print("ERR: There was a problem downloading the archive file: {}".format(temp_archive_name.name))
+            sys.exit(1)
 
-    # Iterate until the total number of requested links has been retrieved for the paginated HTML pages
-    while links_retrieved < required_num_links:
-        try:
-            r = requests.get(base_url_address + current_uri, timeout=timeout)
-            html_page = r.text
+        # Unpack the archive to a temp directory
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            with zipfile.ZipFile(temp_archive_name, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir_name)
+            print("Finished unpacking")
 
-        except requests.ConnectionError as e:
-            print("Connection error. Please retry later: ".format(e))
-            return False
+            # Find all the txt files which have been unpacked
+            list_of_txt_files = find_files_in_directory(filename_glob_pattern, temp_dir_name)
 
-        except requests.Timeout as e:
-            print("Request timed out: {} (set to {} seconds). Please retry later".format(e, timeout))
-            return False
+            # Output how many matching files have been found in the archive
+            print("There are {} file(s) matching the pattern '{}'"
+                  .format(len(list_of_txt_files), filename_glob_pattern))
 
-        # Parse the HTML page for href links
-        soup = BeautifulSoup(html_page, "html.parser")
+            # Only one file found in the archive matching the pattern. Currently the only supported route
+            if len(list_of_txt_files) == 1:
+                # Create Kafka Producer client
+                p = Producer(kafka_client_config)
 
-        soup_links = soup.find_all("a")
-        for link in soup_links:
-            # Ensure the link matches our desired filename pattern
-            if re.search(file_name_regex, link.get("href")):
-                extracted_href_links.append(link.get("href"))
+                # Process messages
+                result = process_book_in_full(client=p, file_path=list_of_txt_files[0],
+                                              prefix=title_regex_prefix, kafka_topic=topic)
 
-        links_retrieved = len(extracted_href_links)
+                # Successful book title lookup and messages have been sent to kafka
+                if result:
+                    print("Waiting until all the messages have been delivered to the broker...")
+                    p.flush()
 
-        # The next page link is always the last href on the page
-        next_uri = soup_links[-1].get("href")
-        print("Retrieved {} links; Current_uri: {}; Next_uri: {}; Query_time: {}s"
-              .format(links_retrieved, current_uri, next_uri, r.elapsed.total_seconds()))
+                    return result
 
-        current_uri = next_uri
-        time.sleep(sleep_interval)             # Reduce load on the remote server
+                # Keep track of books we failed to process
+                else:
+                    return {"failed_url": archive_url}
 
-    return extracted_href_links
+            # Multiple files matching the pattern in the archive - skipping as not currently supported
+            elif len(list_of_txt_files) > 1:
+                print("WARN: Skipping archive. Multiple matching files in archive are currently not supported")
+                return {"failed_url": archive_url}
 
-
-def find_files_in_directory(pattern, path):
-    """
-    Returns a list of files which match a filename pattern within the directory path, including subdirectories
-    :param pattern: shell glob style pattern to match against filenames
-    :param path: the base directory to start the search from
-    :return: list of files which match the pattern. Return 0 if it isn't a directory
-    """
-    # Check the path is a directory
-    if os.path.isdir(path):
-        found_files = []
-        # Iterate through all directories (inc. sub directories), and compare the filename against the pattern
-        for root, dirs, files in os.walk(path):
-            for name in files:
-                if fnmatch.fnmatch(name, pattern):
-                    found_files.append(os.path.join(root, name))
-        return found_files
-    else:
-        print("ERR: {} is not a directory".format(path))
-        return 0
-
-
-def display_producer_stats(success_objects, failure_objects):
-    """
-    Displays the statistics for success and failures after processing books
-    :param success_objects: List containing the return objects for successful tasks
-    :param failure_objects: List containing the return objects for failed tasks
-    :return: None
-    """
-
-    # Display some producer stats
-    print("\n\nProducer Statistics\n====================\n")
-
-    if success_objects:
-        print("Successful tasks:\n===================")
-        for success in success_objects:
-            print("Title: {} (Path: {})".format(success["book_title"].rstrip(), success["file_path"]))
-
-    if failure_objects:
-        print("\nFailed tasks:\n===================")
-        for failure in failure_objects:
-            print("URL: {}".format(failure['url']))
-
-    print("\nSuccessfully processed {} archives\nFailed to process {} archives"
-          .format(len(success_objects), len(failure_objects)))
+            # No files matching the pattern in the archive
+            else:
+                print("WARN: Skipping archive. No matching files found")
+                return {"failed_url": archive_url}
 
 
 if __name__ == "__main__":
 
     # Variables todo: extract as environment variables
-    num_books_to_process = 30
-
-    kafka_client_config = {"bootstrap.servers": "localhost:29092,localhost:29093"}
+    num_books_to_process = 5
+    bootstrap_servers = "localhost:29092,localhost:29093"
+    kafka_client_config = {"bootstrap.servers": bootstrap_servers}
     html_request_timeout = 5
     topic = "important-topic"
     title_regex_prefix = "^Title:"
@@ -290,76 +352,29 @@ if __name__ == "__main__":
     list_of_sending_stats = []
     list_of_failed_to_process_books = []
 
+    print("Starting Query...\n=================")
+
     archive_links_list = retrieve_archive_links(base_url, starting_uri, num_books_to_process, html_request_timeout)
     if not archive_links_list:
         print("ERR: Unable to retrieve any links. Exiting")
         sys.exit(3)
 
-    # Download and un-archive files
     if len(archive_links_list) > 0:
         print("{} links retrieved".format(len(archive_links_list)))
         print("Configured to process {} archive(s)".format(num_books_to_process))
 
         # Iterate over the requested number of archives
         for url in archive_links_list[:num_books_to_process]:
-            print("\n> Processing archive: {}".format(url))
 
-            # todo: add error handling & optional sleep period
-            # Steam the download to temporary file
-            r = requests.get(url, stream=True, timeout=html_request_timeout)
+            # Download archive, unpack, determine book title and send to kafka for further processing
+            processed_result = process_archive(kafka_client_config, url, html_request_timeout, filename_glob_pattern,
+                                               title_regex_prefix, topic)
 
-            with tempfile.TemporaryFile(mode='w+b') as temp_archive_name:   # read + write + binary mode
-                for chunk in r.iter_content(chunk_size=128):
-                    temp_archive_name.write(chunk)
-                # Check a file is now present and it contains data
-                if os.stat(temp_archive_name.name).st_size > 0:
-                    print("Download complete ({} bytes). Unpacking...".format(os.stat(temp_archive_name.name).st_size))
-                else:
-                    print("ERR: There was a problem downloading the archive file: {}".format(temp_archive_name.name))
-
-                # Unpack the archive to a temp directory
-                with tempfile.TemporaryDirectory() as temp_dir_name:
-                    with zipfile.ZipFile(temp_archive_name, 'r') as zip_ref:
-                        zip_ref.extractall(temp_dir_name)
-                    print("Finished unpacking. Temp files are located in: {}".format(temp_dir_name))
-
-                    # Find all the txt files which have been unpacked
-                    list_of_txt_files = find_files_in_directory(filename_glob_pattern, temp_dir_name)
-
-                    # Output how many matching files have been found in the archive
-                    print("There are {} file(s) matching the pattern '{}'"
-                          .format(len(list_of_txt_files), filename_glob_pattern))
-
-                    # Only one file found in the archive matching the pattern. Currently the only supported route
-                    if len(list_of_txt_files) == 1:
-                        # Create Kafka Producer client
-                        p = Producer(kafka_client_config)
-
-                        # Process messages
-                        result = process_book_in_full(client=p, file_path=list_of_txt_files[0],
-                                                      prefix=title_regex_prefix, kafka_topic=topic)
-
-                        # Successful book title lookup and messages have been sent to kafka
-                        if result:
-                            print("Waiting until all the messages have been delivered to the broker...")
-                            p.flush()
-
-                            # Add to successful list to allow us to display stats at the end
-                            list_of_sending_stats.append(result)
-
-                        # Keep track of books we failed to process
-                        else:
-                            list_of_failed_to_process_books.append({"url": url})
-
-                    # Multiple files matching the pattern in the archive - skipping as not currently supported
-                    elif len(list_of_txt_files) > 1:
-                        print("WARN: Skipping archive. Multiple matching files in archive are currently not supported")
-                        list_of_failed_to_process_books.append({"url": url})
-
-                    # No files matching the pattern in the archive
-                    else:
-                        print("WARN: Skipping archive. No matching files found")
-                        list_of_failed_to_process_books.append({"url": url})
+            if processed_result.get('failed_url'):
+                # Keep track of books we failed to process
+                list_of_failed_to_process_books.append(processed_result['failed_url'])
+            else:
+                list_of_sending_stats.append(processed_result)
 
         # Display stats
         display_producer_stats(list_of_sending_stats, list_of_failed_to_process_books)
