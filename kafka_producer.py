@@ -2,6 +2,7 @@
 Kafka producer which sends lines from text files for processing
 """
 
+from dotenv import load_dotenv         # load .env file
 from confluent_kafka import Producer, KafkaException
 import sys
 import re
@@ -156,7 +157,6 @@ def produce_kafka_message(client, topic, message):
         print("% Local producer queue is full ({} messages awaiting delivery): try again".format(len(client)))
 
 
-# todo: resolve unicode error (encoding?)
 def read_text_file_to_list(path):
     """
     Reads a text file and returns a list of the lines
@@ -276,12 +276,30 @@ def process_book_in_full(client, file_path, prefix, kafka_topic):
 
 
 def process_archive(kafka_client_config, archive_url, timeout, filename_glob_pattern, title_regex_prefix, topic):
+    """
+    Download the archive, unpack then process the book (text file) inside by streaming it to Kafka
+    :param kafka_client_config: options to pass to the Kafka producer client. Dict.
+    :param archive_url: HTTP URL of the archive to be downloaded
+    :param timeout: how long (in seconds) before the HTTP connection times out
+    :param filename_glob_pattern: pattern used to identity books in the archive
+    :param title_regex_prefix: regular expression used to find the book title from within the text file
+    :param topic: which Kafka topic are we streaming the contents to
+    :return: Dict result object on success. Dict containing the url of any failed to process books
+    """
     print("\n> Processing archive: {}".format(archive_url))
 
     # todo: add error handling & optional sleep period
     # Steam the download to temporary file
-    # Settings Stream=True mean the download is deferred until iter_content is called
-    r = requests.get(archive_url, stream=True, timeout=timeout)
+    # Settings Stream=True means the download is deferred until iter_content is called
+    try:
+        r = requests.get(archive_url, stream=True, timeout=timeout)
+    except requests.ConnectionError:
+        print("Connection error for {}. Please retry later: ".format(archive_url))
+        return {"failed_url": archive_url}
+
+    except requests.Timeout:
+        print("Request timed out for {} (set to {} seconds). Please retry later".format(archive_url, timeout))
+        return {"failed_url": archive_url}
 
     with tempfile.TemporaryFile(mode='w+b') as temp_archive_name:   # read + write + binary mode
         for chunk in r.iter_content(chunk_size=128):
@@ -339,36 +357,39 @@ def process_archive(kafka_client_config, archive_url, timeout, filename_glob_pat
 
 if __name__ == "__main__":
 
-    # Variables todo: extract as environment variables
-    num_books_to_process = 5
-    bootstrap_servers = "localhost:29092,localhost:29093"
-    kafka_client_config = {"bootstrap.servers": bootstrap_servers}
-    html_request_timeout = 5
-    topic = "important-topic"
-    title_regex_prefix = "^Title:"
-    filename_glob_pattern = "*.txt"
-    base_url = "http://www.gutenberg.org/robot/"
-    starting_uri = "harvest?filetypes[]=txt&langs[]=en"
+    load_dotenv()       # load .env file for development
+
+    # Import variables from envars
+    NUM_OF_BOOKS_TO_PROCESS = int(os.environ.get("NUM_OF_BOOKS_TO_PROCESS"))
+    BOOTSTRAP_SERVERS = os.environ.get("BOOTSTRAP_SERVERS")
+    HTML_REQUEST_TIMEOUT = int(os.environ.get("HTML_REQUEST_TIMEOUT"))
+    KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC")
+    TITLE_REGEX_PREFIX = os.environ.get("TITLE_REGEX_PREFIX")
+    FILENAME_GLOB_PATTERN = os.environ.get("FILENAME_GLOB_PATTERN")
+    BASE_URL = os.environ.get("BASE_URL")
+    STARTING_URI = os.environ.get("STARTING_URI")
+
+    kafka_client_config = {"bootstrap.servers": BOOTSTRAP_SERVERS}
     list_of_sending_stats = []
     list_of_failed_to_process_books = []
 
     print("Starting Query...\n=================")
 
-    archive_links_list = retrieve_archive_links(base_url, starting_uri, num_books_to_process, html_request_timeout)
+    archive_links_list = retrieve_archive_links(BASE_URL, STARTING_URI, NUM_OF_BOOKS_TO_PROCESS, HTML_REQUEST_TIMEOUT)
     if not archive_links_list:
         print("ERR: Unable to retrieve any links. Exiting")
         sys.exit(3)
 
     if len(archive_links_list) > 0:
         print("{} links retrieved".format(len(archive_links_list)))
-        print("Configured to process {} archive(s)".format(num_books_to_process))
+        print("Configured to process {} archive(s)".format(NUM_OF_BOOKS_TO_PROCESS))
 
         # Iterate over the requested number of archives
-        for url in archive_links_list[:num_books_to_process]:
+        for url in archive_links_list[:NUM_OF_BOOKS_TO_PROCESS]:
 
             # Download archive, unpack, determine book title and send to kafka for further processing
-            processed_result = process_archive(kafka_client_config, url, html_request_timeout, filename_glob_pattern,
-                                               title_regex_prefix, topic)
+            processed_result = process_archive(kafka_client_config, url, HTML_REQUEST_TIMEOUT, FILENAME_GLOB_PATTERN,
+                                               TITLE_REGEX_PREFIX, KAFKA_TOPIC)
 
             if processed_result.get('failed_url'):
                 # Keep track of books we failed to process
